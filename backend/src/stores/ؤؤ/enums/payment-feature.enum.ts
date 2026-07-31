@@ -1,0 +1,17 @@
+export enum PaymentFeature {
+  CHECKOUT='checkout',
+  CAPTURE='capture',
+  REFUND='refund',
+  PARTIAL_REFUND='partialRefund',
+  CANCEL='cancel',
+  WEBHOOK='webhook',
+  SUBSCRIPTIONS='subscriptions',
+  RECURRING='recurring',
+  SAVED_CARDS='savedCards',
+  TOKENIZATION='tokenization',
+  APPLE_PAY='applePay',
+  GOOGLE_PAY='googlePay',
+  INSTALLMENTS='installments',
+  MARKETPLACE='marketplace',
+  SPLIT_PAYMENTS='splitPayments',
+}
