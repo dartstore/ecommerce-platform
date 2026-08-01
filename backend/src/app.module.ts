@@ -11,7 +11,6 @@ import { StoreModule } from './stores/store.module'
 import { ProductModule } from './stores/products/product.module'
 import { OrderModule } from './stores/orders/order.module'
 import { CollectionsModule } from './stores/collections/collections.module'
-import { PaymentModule } from './stores/payments/payment.module'
 import { UploadsModule } from './uploads/uploads.module'
 
 @Module({
@@ -22,7 +21,6 @@ import { UploadsModule } from './uploads/uploads.module'
     DevicesModule,
     NotificationsModule,
     EventEmitterModule.forRoot(),
-    PaymentModule,
     CollectionsModule,
     OrderModule,
     ProductModule,
