@@ -12,6 +12,7 @@ import { ProductModule } from './stores/products/product.module'
 import { OrderModule } from './stores/orders/order.module'
 import { CollectionsModule } from './stores/collections/collections.module'
 import { UploadsModule } from './uploads/uploads.module'
+import { ActiveStoreModule } from './stores/active-store.module'
 
 @Module({
   imports: [
@@ -26,7 +27,8 @@ import { UploadsModule } from './uploads/uploads.module'
     ProductModule,
     StoreModule,
     UploadsModule,
-    
+    ActiveStoreModule,
+
   ],
   controllers: [AppController],
   providers: [AppService],
