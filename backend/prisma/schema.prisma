@@ -1063,3 +1063,148 @@ enum PaymentTransactionType {
   CAPTURE
   VOID
 }
+
+/**/
+
+// ═══════════════════════════════════════════════════════════════════
+// Phase 1a — Foundations
+//
+// إضافات فقط. مفيش أي موديل أو حقل أو index موجود اتغيّر.
+// موديلات الدفع القديمة (StorePaymentProvider, PaymentTransaction, ...)
+// سايبينها زي ما هي بالظبط، وهتتشال في المرحلة 1b مع بدائلها.
+//
+// ملاحظة على التقسيم (partitioning): الجداول دي مش مقسّمة في 1a لأنها
+// هتفضل فاضية في الإنتاج (مفيش producer). التقسيم بيتعمل في 1b مع أول
+// producer، وقتها التحويل drop-and-recreate على جدول فاضي.
+// ═══════════════════════════════════════════════════════════════════
+
+/// وضع التشغيل — العزل الكامل بين بيانات الاختبار والبيانات الحقيقية.
+/// في المرحلة 1a بيتبعت كمعامل صريح؛ الحل التلقائي بييجي في 1b.
+enum Mode {
+  test
+  live
+}
+
+enum OutboxStatus {
+  pending
+  claimed
+  published
+  failed
+  dead
+}
+
+enum IdempotencyStatus {
+  in_flight
+  completed
+  failed
+}
+
+/// سجل الطلبات المتكرّرة (Idempotency).
+///
+/// مفيش FK على store عن قصد: السجل لازم يفضل موجود حتى لو المتجر
+/// اتحذف، عشان التدقيق. store_id هنا قيمة نطاق مش اعتماد مرجعي.
+model PaymentIdempotencyRecord {
+  id BigInt @id @default(autoincrement())
+
+  store_id BigInt
+  mode     Mode
+
+  /// اسم العملية المنطقي، مثال: "payments.create_intent"
+  scope String @db.VarChar(100)
+
+  /// المفتاح اللي بعته العميل في هيدر Idempotency-Key
+  idempotency_key String @db.VarChar(255)
+
+  /// hash للـ method + path + body بعد التطبيع — عشان نكشف
+  /// نفس المفتاح مع body مختلف
+  request_fingerprint String @db.VarChar(64)
+
+  status IdempotencyStatus @default(in_flight)
+
+  response_status_code Int?
+  /// الرد المخزّن للإعادة. بيمرّ على redaction قبل التخزين.
+  response_body        Json?
+
+  /// حجز للطلب الجاري — الطلب المكرر المتزامن بيستنى أو يترفض
+  locked_until DateTime? @db.Timestamptz(6)
+
+  created_at   DateTime  @default(now()) @db.Timestamptz(6)
+  completed_at DateTime? @db.Timestamptz(6)
+  expires_at   DateTime  @db.Timestamptz(6)
+
+  @@unique([store_id, mode, scope, idempotency_key])
+  @@index([expires_at])
+  @@index([store_id, mode])
+  @@map("payment_idempotency_records")
+}
+
+/// صندوق الصادر (Transactional Outbox).
+///
+/// الرسالة بتتكتب جوه نفس الـ transaction بتاعة تغيير الحالة، فمفيش
+/// احتمال إن الحالة تتحفظ والحدث يضيع أو العكس.
+///
+/// مفيش FK على store: الحذف المتتالي ماينفعش يمسح أحداث لسه ماتسلّمتش.
+model OutboxMessage {
+  id BigInt @id @default(autoincrement())
+
+  store_id BigInt
+  mode     Mode
+
+  /// نوع الكيان المصدر، مثال: "checkout"
+  aggregate_type String @db.VarChar(64)
+  aggregate_id   String @db.VarChar(64)
+
+  /// نوع الحدث، مثال: "checkout.committed"
+  event_type    String @db.VarChar(100)
+  /// إصدار عقد الحدث — موجود من الرسالة رقم 1، مش من رقم 100000
+  event_version Int    @default(1)
+
+  payload Json
+
+  status OutboxStatus @default(pending)
+
+  /// حجز للتوزيع — بيخلي أكتر من instance تشتغل بأمان من غير Redis
+  claimed_by        String?   @db.VarChar(100)
+  claim_expires_at  DateTime? @db.Timestamptz(6)
+
+  attempts        Int       @default(0)
+  next_attempt_at DateTime  @default(now()) @db.Timestamptz(6)
+  last_error      String?
+
+  /// وقت حدوث الحدث في العمل (مقابل وقت تسجيله في النظام)
+  occurred_at  DateTime  @db.Timestamptz(6)
+  created_at   DateTime  @default(now()) @db.Timestamptz(6)
+  published_at DateTime? @db.Timestamptz(6)
+
+  consumptions ConsumedEvent[]
+
+  @@index([status, next_attempt_at])
+  @@index([aggregate_type, aggregate_id])
+  @@index([store_id, mode])
+  @@index([created_at])
+  @@map("outbox_messages")
+}
+
+/// سجل استهلاك الأحداث لكل مستهلك.
+///
+/// القيد الفريد ده **هو** ضمانة الـ at-least-once، مش فحص في الكود.
+model ConsumedEvent {
+  id BigInt @id @default(autoincrement())
+
+  consumer_name String @db.VarChar(100)
+  message_id    BigInt
+
+  store_id BigInt
+  mode     Mode
+
+  consumed_at DateTime @default(now()) @db.Timestamptz(6)
+  /// نتيجة مختصرة للتشخيص، مثال: "ok" أو "skipped:duplicate"
+  result      String?  @db.VarChar(255)
+
+  message OutboxMessage @relation(fields: [message_id], references: [id], onDelete: Cascade)
+
+  @@unique([consumer_name, message_id])
+  @@index([message_id])
+  @@index([store_id, mode])
+  @@map("consumed_events")
+}
