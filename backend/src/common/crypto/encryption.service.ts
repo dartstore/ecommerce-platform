@@ -1,77 +1,198 @@
-import { Injectable } from '@nestjs/common'
+import { Inject, Injectable } from '@nestjs/common'
 import * as crypto from 'crypto'
+import {
+  assertKeyVersion,
+  buildAad,
+  CIPHER_ALGORITHM,
+  DERIVED_KEY_LENGTH,
+  DecryptionError,
+  ENVELOPE_HEADER_LENGTH,
+  ENVELOPE_VERSION,
+  EncryptionContext,
+  EnvelopeScope,
+  IV_LENGTH,
+  KEY_PROVIDER,
+  KeyProvider,
+  OFFSET_CIPHERTEXT,
+  OFFSET_DERIVED_KEY_VERSION,
+  OFFSET_ENVELOPE_VERSION,
+  OFFSET_IV,
+  OFFSET_KEK_VERSION,
+  OFFSET_SCOPE,
+  OFFSET_TAG,
+  packEnvelopeHeader,
+  wipe,
+} from './key-provider.interface'
 
-const ALGORITHM = 'aes-256-gcm'
-const IV_LENGTH = 12   // القياس الموصى بيه لـ GCM
-const TAG_LENGTH = 16
+export const PLATFORM_KEY_VERSION = 1
 
-/**
- * خدمة تشفير عامة لأي بيانات حساسة (مش بس بوابات الدفع — ينفع تستخدمها
- * لأي حقل تاني محتاج تشفير في المستقبل).
- *
- * المفتاح بييجي من env variable PAYMENT_ENCRYPTION_KEY، لازم يكون:
- *   - 32 byte بعد فك الـ base64
- *   - ثابت طول العمر (لو غيرته، أي بيانات متشفرة قديمة هتبقى غير قابلة للفك)
- *   - اتولده مرة واحدة بالأمر: openssl rand -base64 32
- *   - محفوظ في .env بس، وميتبعتش أبداً في أي response أو log
- */
 @Injectable()
 export class EncryptionService {
-  private readonly key: Buffer
+  constructor(
+    @Inject(KEY_PROVIDER) private readonly keyProvider: KeyProvider,
+  ) {}
 
-  constructor() {
-    const rawKey = process.env.PAYMENT_ENCRYPTION_KEY
-    if (!rawKey) {
-      throw new Error(
-        'PAYMENT_ENCRYPTION_KEY غير موجود في environment variables. ' +
-        'ضيفه في .env — ولّده بالأمر: openssl rand -base64 32',
-      )
-    }
-    const decoded = Buffer.from(rawKey, 'base64')
-    if (decoded.length !== 32) {
-      throw new Error(
-        `PAYMENT_ENCRYPTION_KEY لازم يكون 32 byte بعد فك الـ base64 (حالياً ${decoded.length} byte). ` +
-        'ولّده بالأمر: openssl rand -base64 32',
-      )
-    }
-    this.key = decoded
-  }
+  async encrypt(
+    plainText: string,
+    context: EncryptionContext,
+  ): Promise<string> {
+    /** F2: AAD built before the try — context errors are bugs, not incidents */
+    const aad = buildAad(EnvelopeScope.Platform, null, context)
 
-  /** يشفر نص عادي ويرجع payload واحد (iv + authTag + ciphertext) في base64 */
-  encrypt(plainText: string): string {
-    const iv = crypto.randomBytes(IV_LENGTH)
-    const cipher = crypto.createCipheriv(ALGORITHM, this.key, iv)
-    const encrypted = Buffer.concat([cipher.update(plainText, 'utf8'), cipher.final()])
-    const authTag = cipher.getAuthTag()
+    const kekVersion = await this.keyProvider.currentKekVersion()
+    assertKeyVersion('kek_version', kekVersion)
 
-    return Buffer.concat([iv, authTag, encrypted]).toString('base64')
-  }
+    const platformKey = await this.derivePlatformKey(
+      kekVersion,
+      PLATFORM_KEY_VERSION,
+    )
 
-  /** يفك تشفير payload اترجع من encrypt() */
-  decrypt(payload: string): string {
-    const raw = Buffer.from(payload, 'base64')
-    const iv = raw.subarray(0, IV_LENGTH)
-    const authTag = raw.subarray(IV_LENGTH, IV_LENGTH + TAG_LENGTH)
-    const encrypted = raw.subarray(IV_LENGTH + TAG_LENGTH)
-
-    const decipher = crypto.createDecipheriv(ALGORITHM, this.key, iv)
-    decipher.setAuthTag(authTag)
-    const decrypted = Buffer.concat([decipher.update(encrypted), decipher.final()])
-    return decrypted.toString('utf8')
-  }
-
-  /** helper: يشفر object كامل (بيانات بوابة دفع مثلاً) */
-  encryptJson(obj: Record<string, any>): string {
-    return this.encrypt(JSON.stringify(obj))
-  }
-
-  /** helper: يفك تشفير ويرجع object، أو null لو مفيش بيانات أو فشل الفك */
-  decryptJson<T = Record<string, any>>(payload: string | null | undefined): T | null {
-    if (!payload) return null
     try {
-      return JSON.parse(this.decrypt(payload)) as T
+      const iv = crypto.randomBytes(IV_LENGTH)
+
+      const cipher = crypto.createCipheriv(CIPHER_ALGORITHM, platformKey, iv)
+      cipher.setAAD(aad)
+
+      const encrypted = Buffer.concat([
+        cipher.update(plainText, 'utf8'),
+        cipher.final(),
+      ])
+      const authTag = cipher.getAuthTag()
+
+      const header = packEnvelopeHeader({
+        envelopeVersion: ENVELOPE_VERSION,
+        scope: EnvelopeScope.Platform,
+        kekVersion,
+        derivedKeyVersion: PLATFORM_KEY_VERSION,
+      })
+
+      return Buffer.concat([header, iv, authTag, encrypted]).toString('base64')
+    } finally {
+      wipe(platformKey)
+    }
+  }
+
+  async decrypt(payload: string, context: EncryptionContext): Promise<string> {
+    const raw = Buffer.from(payload, 'base64')
+
+    /** F1: strictly less-than — GCM ciphertext length == plaintext length */
+    if (raw.length < ENVELOPE_HEADER_LENGTH) {
+      throw new DecryptionError(
+        'malformed',
+        'نص مشفّر تالف: الحجم أصغر من الحد الأدنى.',
+      )
+    }
+
+    const envelopeVersion = raw.readUInt8(OFFSET_ENVELOPE_VERSION)
+
+    if (envelopeVersion !== ENVELOPE_VERSION) {
+      throw new DecryptionError(
+        'unsupported_version',
+        `إصدار envelope غير معروف (${envelopeVersion}). ` +
+          `الإصدار المدعوم: ${ENVELOPE_VERSION}.`,
+      )
+    }
+
+    const scope = raw.readUInt8(OFFSET_SCOPE)
+
+    if (scope !== EnvelopeScope.Platform) {
+      throw new DecryptionError(
+        'malformed',
+        `النص ده نطاقه ${scope} مش نطاق المنصة. ` +
+          `لو نطاقه متجر استخدم StoreKeyService.`,
+      )
+    }
+
+    /** F2 */
+    const aad = buildAad(EnvelopeScope.Platform, null, context)
+
+    const kekVersion = raw.readUInt16BE(OFFSET_KEK_VERSION)
+    const derivedKeyVersion = raw.readUInt16BE(OFFSET_DERIVED_KEY_VERSION)
+
+    /** F3: const, not let — no definite-assignment ambiguity */
+    const platformKey = await this.derivePlatformKeyOrThrow(
+      kekVersion,
+      derivedKeyVersion,
+    )
+
+    try {
+      const iv = raw.subarray(OFFSET_IV, OFFSET_TAG)
+      const authTag = raw.subarray(OFFSET_TAG, OFFSET_CIPHERTEXT)
+      const encrypted = raw.subarray(OFFSET_CIPHERTEXT)
+
+      const decipher = crypto.createDecipheriv(
+        CIPHER_ALGORITHM,
+        platformKey,
+        iv,
+      )
+      decipher.setAAD(aad)
+      decipher.setAuthTag(authTag)
+
+      const decrypted = Buffer.concat([
+        decipher.update(encrypted),
+        decipher.final(),
+      ])
+
+      return decrypted.toString('utf8')
     } catch {
-      return null
+      throw new DecryptionError(
+        'integrity',
+        'فشل التحقق من سلامة النص المشفّر. ' +
+          'الاحتمالات: عبث بالبيانات، أو نقل النص لصف/وضع تاني، أو مفتاح غلط. ' +
+          'الحالة دي تستدعي تنبيه أمني.',
+      )
+    } finally {
+      wipe(platformKey)
+    }
+  }
+
+  async encryptJson(
+    obj: Record<string, any>,
+    context: EncryptionContext,
+  ): Promise<string> {
+    return this.encrypt(JSON.stringify(obj), context)
+  }
+
+  async decryptJson<T = Record<string, any>>(
+    payload: string | null | undefined,
+    context: EncryptionContext,
+  ): Promise<T | null> {
+    if (!payload) return null
+
+    return JSON.parse(await this.decrypt(payload, context)) as T
+  }
+
+  private async derivePlatformKeyOrThrow(
+    kekVersion: number,
+    platformKeyVersion: number,
+  ): Promise<Buffer> {
+    try {
+      return await this.derivePlatformKey(kekVersion, platformKeyVersion)
+    } catch (error) {
+      throw new DecryptionError('key_unavailable', (error as Error).message)
+    }
+  }
+
+  private async derivePlatformKey(
+    kekVersion: number,
+    platformKeyVersion: number,
+  ): Promise<Buffer> {
+    assertKeyVersion('platform_key_version', platformKeyVersion)
+
+    const kek = await this.keyProvider.getKek(kekVersion)
+
+    try {
+      const derived = crypto.hkdfSync(
+        'sha256',
+        kek,
+        Buffer.from('platform', 'utf8'),
+        Buffer.from(`platform:v${platformKeyVersion}`, 'utf8'),
+        DERIVED_KEY_LENGTH,
+      )
+
+      return Buffer.from(derived)
+    } finally {
+      wipe(kek)
     }
   }
 }
