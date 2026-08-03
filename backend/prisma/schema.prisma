@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════════════════════════════════
-// PHASE-1A-SCHEMA-V2  (Order reconciled to database truth)
+// PHASE-1B.1-SCHEMA-V1  (payment accounts + offerings)
 //
 // لو السطر ده مش موجود في أول prisma/schema.prisma عندك، يبقى الملف
 // المطبَّق مش الملف ده.
@@ -383,7 +383,7 @@ model store {
   tags                Tag[]
   collections         Collection[]
   orders              Order[]
-  paymentProviders    StorePaymentProvider[]
+  paymentAccounts     PaymentAccount[]
 
   users users @relation(fields: [ownerId], references: [id])
 }
@@ -831,31 +831,175 @@ enum PaymentProviderKey {
   fabmisr
 }
 
-model StorePaymentProvider {
-  id       BigInt @id @default(autoincrement())
+/// وسيلة الدفع زي ما العميل بيشوفها.
+///
+/// مختلفة عن PaymentProviderKey: البوابة الواحدة بتقدّم أكتر من وسيلة،
+/// والوسيلة الواحدة بتتقدّم من أكتر من بوابة.
+enum PaymentMethodKey {
+  card
+  mada
+  knet
+  benefit
+  apple_pay
+  google_pay
+  wallet
+  kiosk
+  bank_transfer
+  cod
+  bnpl
+}
+
+enum OwnershipModel {
+  /// التاجر بيدخل مفاتيح البوابة بنفسه
+  merchant_credentials
+  /// حساب متصل تديره المنصة — المرحلة 6
+  platform_managed
+}
+
+enum PaymentAccountStatus {
+  /// اتعمل بس لسه مافيش بيانات اعتماد
+  draft
+  /// بيانات الاعتماد موجودة والتحقق منها لسه ماتمش
+  verifying
+  active
+  disabled
+  /// آخر تحقق فشل — التفاصيل في last_error
+  errored
+}
+
+/// نوع الالتزام اللي وسيلة الدفع بتنتجه لما العميل يأكّد الطلب
+enum CommitmentKind {
+  /// تفويض أو تحصيل نجح فعلاً (Stripe / Paymob / Moyasar / Tap)
+  funds_secured
+  /// وعد غير ممول والتاجر بيقبله (الدفع عند الاستلام / تحويل بنكي)
+  promise_accepted
+  /// صدر رقم مرجعي والعميل هيدفع بعدين (فوري / كشك)
+  awaiting_offline_settlement
+}
+
+enum CaptureMode {
+  automatic
+  manual
+}
+
+/// وسائل الدفع اللي العميل بيشوفها عند الدفع.
+///
+/// صف لكل (حساب × وسيلة × إعداد البوابة). ده اللي بيحل مشكلة البوابات
+/// اللي بتقدّم أكتر من تكامل تحت نفس الحساب — زي Paymob اللي بيديك
+/// integration_id مختلف للكارت والمحفظة والكشك، والتاجر عايز يعرضهم
+/// كأزرار منفصلة في صفحة الدفع.
+model PaymentMethodOffering {
+  id BigInt @id @default(autoincrement())
+
+  account_id BigInt
+  account    PaymentAccount @relation(fields: [account_id], references: [id], onDelete: Cascade)
+
+  /// نفس مالك الحساب — متكرر عشان الاستعلامات تتقيّد من غير join
+  store_id BigInt
+  mode     Mode
+
+  method PaymentMethodKey
+
+  /// معرّف التكامل عند البوابة (مثال: integration_id في Paymob).
+  /// نص فاضي معناه إن البوابة مالهاش تكاملات متعددة.
+  gateway_method_config String @default("") @db.VarChar(255)
+
+  enabled  Boolean @default(false)
+  position Int     @default(0)
+
+  /// الاسم اللي بيظهر للعميل. null معناه استخدم الاسم الافتراضي للوسيلة.
+  display_name_ar String? @db.VarChar(120)
+  display_name_en String? @db.VarChar(120)
+
+  /// قيود اختيارية: أقل/أكبر مبلغ، عملات مسموحة، مدن مسموحة.
+  /// المبالغ بالوحدات الصغرى زي أي مبلغ في المشروع.
+  constraints Json?
+
+  /// نوع الالتزام اللي الوسيلة دي بتنتجه — ده اللي بيخلي الدفع عند
+  /// الاستلام وفوري و Stripe يمرّوا بنفس المسار في المرحلة 1b.2.
+  commitment_kind CommitmentKind @default(funds_secured)
+
+  capture_mode CaptureMode @default(automatic)
+
+  created_at DateTime @default(now()) @db.Timestamptz(6)
+  updated_at DateTime @updatedAt @db.Timestamptz(6)
+
+  @@unique([account_id, method, gateway_method_config])
+  @@index([store_id, mode])
+  @@index([account_id])
+  @@index([store_id, mode, enabled, position])
+  @@map("payment_method_offerings")
+}
+
+/// اتصال متجر ببوابة دفع.
+///
+/// المتجر ممكن يكون عنده أكتر من حساب لنفس البوابة (عملات مختلفة،
+/// كيانات مختلفة، أو ترحيل من حساب لحساب)، وعشان كده الاسم المعروض
+/// جزء من مفتاح التفرّد.
+///
+/// ⚠️ المفتاح الأساسي لازم يفضل BigInt مربوط بـ sequence: بيانات
+/// الاعتماد مشفّرة بـ AAD مربوط بـ id الصف، والـ id لازم يبقى معروف
+/// قبل التشفير (شوف IdReservationService).
+model PaymentAccount {
+  id BigInt @id @default(autoincrement())
+
   store_id BigInt
   store    store  @relation(fields: [store_id], references: [id], onDelete: Cascade)
 
-  provider PaymentProviderKey
+  /// عزل كامل بين بيانات الاختبار والبيانات الحقيقية
+  mode Mode
 
-  enabled      Boolean @default(false)
-  is_test_mode Boolean @default(true)
+  gateway PaymentProviderKey
 
-  // بيانات الاتصال الحساسة (API keys / secrets) — مشفّرة بالكامل (AES-256-GCM)
-  // قبل ما تتخزن هنا. أبداً متتخزنش plaintext.
-  credentials_encrypted String? @db.Text
+  /// اسم من اختيار التاجر يفرّق بين حسابات نفس البوابة
+  display_name String @db.VarChar(120)
 
-  // إعدادات غير حساسة خاصة بالبوابة (مثلاً: بيانات التحويل البنكي، الحد الأدنى للمبلغ...)
-  settings Json? @default("{}")
+  /// merchant_credentials = التاجر بيدخل مفاتيحه بنفسه (الوضع الحالي)
+  /// platform_managed     = حساب متصل تديره المنصة (المرحلة 6)
+  ownership_model OwnershipModel @default(merchant_credentials)
 
-  position Int @default(0)
+  /// معرّف الحساب المتصل عند البوابة — null في وضع مفاتيح التاجر
+  connected_account_ref String? @db.VarChar(255)
 
-  created_at DateTime @default(now())
-  updated_at DateTime @updatedAt
+  /// ═══ بيانات الاعتماد ═══
+  ///
+  /// مشفّرة بمفتاح مشتق للمتجر (StoreKeyService)، والـ AAD مربوط بـ:
+  ///     (store_id, mode, 'payment_account', id, 'credentials')
+  ///
+  /// ⚠️ **مابترجعش أبداً في أي رد API.** الواجهة بتاخد تلميح مقنّع
+  /// (credentials_hint) و is_configured بس.
+  credentials_envelope String?
+  credential_kek_version Int?
+  credential_dek_version Int?
 
-  @@unique([store_id, provider])
-  @@index([store_id])
+  /// HMAC بمفتاح المتجر — للكشف عن التغيير ولعرض تلميح مقنّع،
+  /// مش hash عادي للسر عشان مايبقاش قابل للتخمين
+  credentials_fingerprint String? @db.VarChar(64)
+
+  /// آخر 4 حروف من كل حقل، للعرض بس. مفيش أسرار كاملة هنا.
+  credentials_hint Json?
+
+  /// العملة اللي البوابة بتسوّي بيها على الحساب ده
+  settlement_currency String? @db.VarChar(3)
+
+  status PaymentAccountStatus @default(draft)
+
+  /// نتيجة آخر تحقق من بيانات الاعتماد — بيتملّى في المرحلة 1b.2
+  /// لما أول أدابتر يقدر يكلّم البوابة فعلاً
+  last_verified_at DateTime? @db.Timestamptz(6)
+  last_error       String?
+
+  offerings PaymentMethodOffering[]
+
+  created_at DateTime @default(now()) @db.Timestamptz(6)
+  updated_at DateTime @updatedAt @db.Timestamptz(6)
+
+  @@unique([store_id, mode, gateway, display_name])
+  @@index([store_id, mode])
+  @@index([store_id, mode, status])
+  @@map("payment_accounts")
 }
+
 
 // ═══════════════════════════════════════════════════════════════════
 // Phase 1a — Foundations
@@ -870,8 +1014,8 @@ model StorePaymentProvider {
 //
 // وهترجع بشكلها النهائي في المرحلة 1b.
 //
-// اللي اتساب زي ما هو: StorePaymentProvider و PaymentProviderKey —
-// الاتنين موجودين فعلاً في قاعدة البيانات.
+// PaymentProviderKey اتساب زي ما هو — الـ enum موجود في قاعدة البيانات
+// وبيستخدمه PaymentAccount.
 //
 // ملاحظة على التقسيم (partitioning): الجداول دي مش مقسّمة في 1a لأنها
 // هتفضل فاضية في الإنتاج (مفيش producer). التقسيم بيتعمل في 1b مع أول
